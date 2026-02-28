@@ -157,6 +157,124 @@ async function getOapiAccessToken(config: any): Promise<string | null> {
   }
 }
 
+// ============ 钉钉媒体文件下载 ============
+
+/** 支持的图片扩展名 */
+const SUPPORTED_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
+
+/** 检查是否为图片文件 */
+function isImageFileByName(filename: string): boolean {
+  const ext = filename.toLowerCase().slice(filename.lastIndexOf('.'));
+  return SUPPORTED_IMAGE_EXTENSIONS.includes(ext);
+}
+
+/**
+ * 使用 downloadCode 从钉钉下载媒体文件（新版 API：api.dingtalk.com 机器人消息文件下载）
+ * @param config 钉钉配置（用于获取 api access_token）
+ * @param downloadCode 钉钉提供的下载码（图片为 pictureDownloadCode，文件为 downloadCode）
+ * @param fileName 文件名（用于确定扩展名）
+ * @param log 日志对象
+ * @returns 本地文件路径或 null
+ */
+async function downloadMediaFromDingTalk(
+  config: any,
+  downloadCode: string,
+  fileName: string,
+  log?: any,
+): Promise<string | null> {
+  try {
+    const fs = await import('fs');
+    const path = await import('path');
+    const os = await import('os');
+
+    // 使用新版 API 的 token（api.dingtalk.com），非 oapi
+    const apiToken = await getAccessToken(config);
+    log?.info?.(`[DingTalk][Download] 1获取下载URL: downloadCode=${downloadCode.slice(0, 20)}...`);
+
+    // 钉钉开放平台：下载机器人接收消息的文件内容 POST /v1.0/robot/messageFiles/download
+    const downloadUrlResp = await axios.post(
+      'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
+      {
+        downloadCode,
+        // robotCode 必填，使用当前机器人应用的 AppKey（即 clientId）
+        robotCode: config.clientId,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-acs-dingtalk-access-token': apiToken,
+        },
+        timeout: 30_000,
+      },
+    );
+
+    // 新版 API 成功时返回 body 含 downloadUrl（钉钉文档可能为 downloadUrl / result.downloadUrl 等）
+    const d = downloadUrlResp.data;
+    const downloadUrl =
+      d?.downloadUrl ??
+      d?.download_url ??
+      d?.result?.downloadUrl ??
+      d?.body?.downloadUrl ??
+      (typeof d === 'string' ? d : null);
+    if (!downloadUrl) {
+      log?.error?.(`[DingTalk][Download] 下载URL为空，响应: ${JSON.stringify(d).slice(0, 200)}`);
+      return null;
+    }
+
+    log?.info?.(`[DingTalk][Download] 获取到下载URL: ${String(downloadUrl).slice(0, 100)}...`);
+
+    // 2. 下载文件内容
+    const fileResp = await axios.get(downloadUrl, {
+      responseType: 'arraybuffer',
+      timeout: 60_000,
+      maxContentLength: 50 * 1024 * 1024, // 最大50MB
+    });
+
+    // 3. 确定文件扩展名
+    let ext = path.extname(fileName);
+    if (!ext) {
+      // 从Content-Type推断
+      const contentType = fileResp.headers['content-type'];
+      if (contentType?.includes('image/jpeg') || contentType?.includes('image/jpg')) ext = '.jpg';
+      else if (contentType?.includes('image/png')) ext = '.png';
+      else if (contentType?.includes('image/gif')) ext = '.gif';
+      else if (contentType?.includes('application/pdf')) ext = '.pdf';
+      else ext = '';
+    }
+
+    // 4. 生成本地保存路径
+    const inboundDir = path.join(os.homedir(), '.openclaw', 'media', 'inbound');
+    if (!fs.existsSync(inboundDir)) {
+      fs.mkdirSync(inboundDir, { recursive: true });
+    }
+
+    const timestamp = Date.now();
+    const safeFileName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    // 避免重复扩展名，例如 image.jpg + .jpg -> image.jpg.jpg
+    const baseName =
+      ext && safeFileName.toLowerCase().endsWith(ext.toLowerCase())
+        ? safeFileName.slice(0, -ext.length)
+        : safeFileName;
+    const localFileName = `dingtalk_${timestamp}_${baseName}${ext}`;
+    const localPath = path.join(inboundDir, localFileName);
+
+    // 5. 保存文件
+    fs.writeFileSync(localPath, Buffer.from(fileResp.data));
+
+    const fileSizeMB = (fileResp.data.length / (1024 * 1024)).toFixed(2);
+    log?.info?.(`[DingTalk][Download] 文件下载成功: ${localPath} (${fileSizeMB}MB)`);
+
+    return localPath;
+  } catch (err: any) {
+    log?.error?.(`[DingTalk][Download] 下载失败: ${err.message}`);
+    if (err.response) {
+      log?.error?.(`[DingTalk][Download] 错误响应: status=${err.response.status} data=${JSON.stringify(err.response.data)}`);
+    }
+    return null;
+  }
+}
+
+
 function buildMediaSystemPrompt(): string {
   return `## 钉钉图片和文件显示规则
 
@@ -1149,7 +1267,11 @@ async function* streamFromGateway(options: GatewayOptions): AsyncGenerator<strin
 
 // ============ 消息处理 ============
 
-function extractMessageContent(data: any): { text: string; messageType: string } {
+async function extractMessageContent(
+  data: any,
+  config: any,
+  log?: any,
+): Promise<{ text: string; messageType: string }> {
   const msgtype = data.msgtype || 'text';
   switch (msgtype) {
     case 'text':
@@ -1159,14 +1281,36 @@ function extractMessageContent(data: any): { text: string; messageType: string }
       const text = parts.filter((p: any) => p.type === 'text').map((p: any) => p.text).join('');
       return { text: text || '[富文本消息]', messageType: 'richText' };
     }
-    case 'picture':
-      return { text: '[图片]', messageType: 'picture' };
+    case 'picture': {
+      // 钉钉图片消息下载码字段为 pictureDownloadCode（Stream 回调里为 content.pictureDownloadCode）
+      // 按官方文档，真正用于文件下载的是 downloadCode，这里优先使用 downloadCode
+      const downloadCode = data.content?.downloadCode ?? data.content?.pictureDownloadCode;
+      const fileName = data.content?.fileName || 'image.jpg';
+      if (downloadCode && config?.clientId) {
+        log?.info?.(`[DingTalk][Message] 检测到图片消息，开始下载...`);
+        const localPath = await downloadMediaFromDingTalk(config, downloadCode, fileName, log);
+        if (localPath) {
+          return { text: `用户发送了图片: ${localPath}`, messageType: 'picture' };
+        }
+      }
+      return { text: '[图片下载失败]', messageType: 'picture' };
+    }
     case 'audio':
       return { text: data.content?.recognition || '[语音消息]', messageType: 'audio' };
     case 'video':
       return { text: '[视频]', messageType: 'video' };
-    case 'file':
+    case 'file': {
+      const downloadCode = data.content?.downloadCode;
+      const fileName = data.content?.fileName || 'file';
+      if (downloadCode && config?.clientId) {
+        log?.info?.(`[DingTalk][Message] 检测到文件消息，开始下载...`);
+        const localPath = await downloadMediaFromDingTalk(config, downloadCode, fileName, log);
+        if (localPath) {
+          return { text: `用户发送了文件: ${localPath}`, messageType: 'file' };
+        }
+      }
       return { text: `[文件: ${data.content?.fileName || '文件'}]`, messageType: 'file' };
+    }
     default:
       return { text: data.text?.content?.trim() || `[${msgtype}消息]`, messageType: msgtype };
   }
@@ -1990,7 +2134,9 @@ async function handleDingTalkMessage(params: {
 }): Promise<void> {
   const { cfg, accountId, data, sessionWebhook, log, dingtalkConfig } = params;
 
-  const content = extractMessageContent(data);
+  // 消息内容解析（图片/文件下载使用 api.dingtalk.com token，由 extractMessageContent 内部获取）
+  const content = await extractMessageContent(data, dingtalkConfig, log);
+  let oapiToken: string | null = await getOapiAccessToken(dingtalkConfig);
   if (!content.text) return;
 
   const isDirect = data.conversationType === '1';
@@ -2022,13 +2168,13 @@ async function handleDingTalkMessage(params: {
 
   // 构建 system prompts & 获取 oapi token（用于图片和文件后处理）
   const systemPrompts: string[] = [];
-  let oapiToken: string | null = null;
-
   if (dingtalkConfig.enableMediaUpload !== false) {
     // 添加图片和文件使用提示（告诉 LLM 直接输出本地路径或文件标记）
     systemPrompts.push(buildMediaSystemPrompt());
-    // 获取 token 用于后处理上传
-    oapiToken = await getOapiAccessToken(dingtalkConfig);
+    // 如果前面获取失败，这里再尝试一次，避免因为临时错误完全失去媒体能力
+    if (!oapiToken) {
+      oapiToken = await getOapiAccessToken(dingtalkConfig);
+    }
     log?.info?.(`[DingTalk][Media] oapiToken 获取${oapiToken ? '成功' : '失败'}`);
   } else {
     log?.info?.(`[DingTalk][Media] enableMediaUpload=false，跳过`);
