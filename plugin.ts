@@ -54,6 +54,15 @@ function isConfigured(cfg: ClawdbotConfig): boolean {
   return Boolean(config.clientId && config.clientSecret);
 }
 
+/** 判断 senderId 是否在 allowlist 中（支持裸 ID、user:xxx、dingtalk:xxx） */
+function isSenderInAllowlist(senderId: string, allowList: string[]): boolean {
+  const normalized = String(senderId).trim();
+  return allowList.some((entry: string) => {
+    const e = String(entry).trim();
+    return e === normalized || e === `user:${normalized}` || e === `dingtalk:${normalized}`;
+  });
+}
+
 // ============ Gateway SSE Streaming ============
 
 interface GatewayOptions {
@@ -690,14 +699,60 @@ async function handleDingTalkMessage(params: {
 }): Promise<void> {
   const { cfg, accountId, data, sessionWebhook, log, dingtalkConfig } = params;
 
+  const isDirect = data.conversationType === '1';
+  const senderId = data.senderStaffId || data.senderId;
+  const senderName = data.senderNick || 'Unknown';
+
+  // ===== Allowlist 检查（私聊 / 群聊共用匹配逻辑） =====
+  const dmPolicy = dingtalkConfig.dmPolicy || 'open';
+  const allowFrom = dingtalkConfig.allowFrom || [];
+  const groupPolicy = dingtalkConfig.groupPolicy || 'open';
+  const groupAllowFrom = dingtalkConfig.groupAllowFrom || [];
+
+  // 私聊 allowlist 检查
+  if (isDirect && dmPolicy === 'allowlist') {
+    // 如果 allowFrom 为空列表，则不允许任何人
+    if (allowFrom.length === 0) {
+      log?.info?.(`[DingTalk] 私聊消息被拒绝: allowlist 为空，不允许任何人`);
+      await sendMessage(dingtalkConfig, sessionWebhook, '⚠️ 机器人当前不接受私聊消息。', {
+        atUserId: senderId,
+      });
+      return;
+    }
+    if (!isSenderInAllowlist(senderId, allowFrom)) {
+      log?.info?.(`[DingTalk] 私聊消息被拒绝: sender=${senderId} 不在 allowlist 中`);
+      await sendMessage(dingtalkConfig, sessionWebhook, '⚠️ 您没有权限与机器人私聊。', {
+        atUserId: senderId,
+      });
+      return;
+    }
+    log?.info?.(`[DingTalk] 私聊 Allowlist 检查通过: sender=${senderId}`);
+  }
+  
+  // 群聊 allowlist 检查
+  if (!isDirect && groupPolicy === 'allowlist') {
+    // 如果 groupAllowFrom 为空列表，则不允许任何人
+    if (groupAllowFrom.length === 0) {
+      log?.info?.(`[DingTalk] 群聊消息被拒绝: groupAllowlist 为空，不允许任何人`);
+      await sendMessage(dingtalkConfig, sessionWebhook, '⚠️ 您没有权限在此群使用机器人。', {
+        atUserId: senderId,
+      });
+      return;
+    }
+    if (!isSenderInAllowlist(senderId, groupAllowFrom)) {
+      log?.info?.(`[DingTalk] 群聊消息被拒绝: sender=${senderId} 不在 groupAllowlist 中`);
+      await sendMessage(dingtalkConfig, sessionWebhook, '⚠️ 您没有权限在此群使用机器人。', {
+        atUserId: senderId,
+      });
+      return;
+    }
+    log?.info?.(`[DingTalk] 群聊 Allowlist 检查通过: sender=${senderId}`);
+  }
+
   // 消息内容解析（图片/文件下载使用 api.dingtalk.com token，由 extractMessageContent 内部获取）
   const content = await extractMessageContent(data, dingtalkConfig, log);
   let oapiToken: string | null = await getOapiAccessToken(dingtalkConfig);
   if (!content.text) return;
-
-  const isDirect = data.conversationType === '1';
-  const senderId = data.senderStaffId || data.senderId;
-  const senderName = data.senderNick || 'Unknown';
 
   log?.info?.(`[DingTalk] 收到消息: from=${senderName} text="${content.text.slice(0, 50)}..."`);
 
