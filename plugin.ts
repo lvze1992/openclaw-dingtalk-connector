@@ -1059,9 +1059,10 @@ async function processFileMarkers(
 // ============ AI Card Streaming ============
 
 const DINGTALK_API = 'https://api.dingtalk.com';
-const AI_CARD_TEMPLATE_ID = '382e4302-551d-4880-bf29-a30acfab2e71.schema';
+// 新模板 45c9632d：卡片数据为 config + content，流式字段为 content（不支持富文本）
+const AI_CARD_TEMPLATE_ID = '45c9632d-ba6e-4cf6-b1c4-39238b264977.schema';
 
-// flowStatus 值与 Python SDK AICardStatus 一致（cardParamMap 的值必须是字符串）
+// 钉钉卡片默认参数：flowStatus 控制展示状态，cardParamMap 值必须为字符串
 const AICardStatus = {
   PROCESSING: '1',
   INPUTING: '2',
@@ -1069,6 +1070,16 @@ const AICardStatus = {
   EXECUTING: '4',
   FAILED: '5',
 } as const;
+
+/** 构建 cardParamMap：新模板 config+content，并保留钉钉默认的 flowStatus、sys_full_json_obj */
+function buildCardParamMap(content: string, flowStatus: string): Record<string, string> {
+  return {
+    config: JSON.stringify({ autoLayout: true }),
+    content: content,
+    flowStatus,
+    sys_full_json_obj: JSON.stringify({ order: ['config', 'content', 'flowStatus'] }),
+  };
+}
 
 interface AICardInstance {
   cardInstanceId: string;
@@ -1097,48 +1108,39 @@ async function createAICard(
   return createAICardForTarget(config, target, log);
 }
 
-// 流式更新 AI Card 内容
+// 流式更新 AI Card 内容（新模板流式字段为 content）
 async function streamAICard(
   card: AICardInstance,
   content: string,
   finished: boolean = false,
   log?: any,
 ): Promise<void> {
-  // 首次 streaming 前，先切换到 INPUTING 状态（与 Python SDK get_card_data(INPUTING) 一致）
+  // 首次 streaming 前，先 PUT 一次空 content，确保卡片进入可流式更新状态
   if (!card.inputingStarted) {
     const statusBody = {
       outTrackId: card.cardInstanceId,
-      cardData: {
-        cardParamMap: {
-          flowStatus: AICardStatus.INPUTING,
-          msgContent: '',
-          staticMsgContent: '',
-          sys_full_json_obj: JSON.stringify({
-            order: ['msgContent'],  // 只声明实际使用的字段，避免部分客户端显示空占位
-          }),
-        },
-      },
+      cardData: { cardParamMap: buildCardParamMap('', AICardStatus.INPUTING) },
     };
-    log?.info?.(`[DingTalk][AICard] PUT /v1.0/card/instances (INPUTING) outTrackId=${card.cardInstanceId}`);
+    log?.info?.(`[DingTalk][AICard] PUT /v1.0/card/instances (初始化) outTrackId=${card.cardInstanceId}`);
     try {
       const statusResp = await axios.put(`${DINGTALK_API}/v1.0/card/instances`, statusBody, {
         headers: { 'x-acs-dingtalk-access-token': card.accessToken, 'Content-Type': 'application/json' },
       });
-      log?.info?.(`[DingTalk][AICard] INPUTING 响应: status=${statusResp.status} data=${JSON.stringify(statusResp.data)}`);
+      log?.info?.(`[DingTalk][AICard] 初始化响应: status=${statusResp.status} data=${JSON.stringify(statusResp.data)}`);
     } catch (err: any) {
-      log?.error?.(`[DingTalk][AICard] INPUTING 切换失败: ${err.message}, resp=${JSON.stringify(err.response?.data)}`);
+      log?.error?.(`[DingTalk][AICard] 初始化失败: ${err.message}, resp=${JSON.stringify(err.response?.data)}`);
       throw err;
     }
     card.inputingStarted = true;
   }
 
-  // 调用 streaming API 更新内容
+  // 新模板流式数据字段为 content
   const body = {
     outTrackId: card.cardInstanceId,
     guid: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    key: 'msgContent',
+    key: 'content',
     content: content,
-    isFull: true,  // 全量替换
+    isFull: true,
     isFinalize: finished,
     isError: false,
   };
@@ -1155,7 +1157,7 @@ async function streamAICard(
   }
 }
 
-// 完成 AI Card：先 streaming isFinalize 关闭流式通道，再 put_card_data 更新 FINISHED 状态
+// 完成 AI Card：先 streaming isFinalize 关闭流式通道，再 PUT 一次最终 content
 async function finishAICard(
   card: AICardInstance,
   content: string,
@@ -1166,29 +1168,20 @@ async function finishAICard(
   // 1. 先用最终内容关闭流式通道（isFinalize=true），确保卡片显示替换后的内容
   await streamAICard(card, content, true, log);
 
-  // 2. 更新卡片状态为 FINISHED
+  // 2. 再 PUT 一次卡片数据，保证最终态一致（含 flowStatus=FINISHED、sys_full_json_obj）
   const body = {
     outTrackId: card.cardInstanceId,
-    cardData: {
-      cardParamMap: {
-        flowStatus: AICardStatus.FINISHED,
-        msgContent: content,
-        staticMsgContent: '',
-        sys_full_json_obj: JSON.stringify({
-          order: ['msgContent'],  // 只声明实际使用的字段，避免部分客户端显示空占位
-        }),
-      },
-    },
+    cardData: { cardParamMap: buildCardParamMap(content, AICardStatus.FINISHED) },
   };
 
-  log?.info?.(`[DingTalk][AICard] PUT /v1.0/card/instances (FINISHED) outTrackId=${card.cardInstanceId}`);
+  log?.info?.(`[DingTalk][AICard] PUT /v1.0/card/instances (完成) outTrackId=${card.cardInstanceId}`);
   try {
     const finishResp = await axios.put(`${DINGTALK_API}/v1.0/card/instances`, body, {
       headers: { 'x-acs-dingtalk-access-token': card.accessToken, 'Content-Type': 'application/json' },
     });
-    log?.info?.(`[DingTalk][AICard] FINISHED 响应: status=${finishResp.status} data=${JSON.stringify(finishResp.data)}`);
+    log?.info?.(`[DingTalk][AICard] 完成响应: status=${finishResp.status} data=${JSON.stringify(finishResp.data)}`);
   } catch (err: any) {
-    log?.error?.(`[DingTalk][AICard] FINISHED 更新失败: ${err.message}, resp=${JSON.stringify(err.response?.data)}`);
+    log?.error?.(`[DingTalk][AICard] 完成更新失败: ${err.message}, resp=${JSON.stringify(err.response?.data)}`);
   }
 }
 
@@ -1459,11 +1452,11 @@ async function createAICardForTarget(
 
     log?.info?.(`[DingTalk][AICard] 开始创建卡片: ${targetDesc}, outTrackId=${cardInstanceId}`);
 
-    // 1. 创建卡片实例
+    // 1. 创建卡片实例（新模板 config+content，并带钉钉默认 flowStatus、sys_full_json_obj）
     const createBody = {
       cardTemplateId: AI_CARD_TEMPLATE_ID,
       outTrackId: cardInstanceId,
-      cardData: { cardParamMap: {} },
+      cardData: { cardParamMap: buildCardParamMap('', AICardStatus.INPUTING) },
       callbackType: 'STREAM',
       imGroupOpenSpaceModel: { supportForward: true },
       imRobotOpenSpaceModel: { supportForward: true },
