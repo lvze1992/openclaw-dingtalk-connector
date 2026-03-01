@@ -1277,9 +1277,22 @@ async function extractMessageContent(
     case 'text':
       return { text: data.text?.content?.trim() || '', messageType: 'text' };
     case 'richText': {
-      const parts = data.content?.richText || [];
-      const text = parts.filter((p: any) => p.type === 'text').map((p: any) => p.text).join('');
-      return { text: text || '[富文本消息]', messageType: 'richText' };
+      const content = data.content ?? {};
+      const parts = content.richText || [];
+      // 钉钉富文本 part 可能是 { type: 'text', text } 或 { type: 'paragraph', content: [...] } 等，兼容多种结构
+      let text = parts
+        .map((p: any) => {
+          if (typeof p?.text === 'string') return p.text;
+          if (typeof p?.content === 'string') return p.content;
+          if (Array.isArray(p?.content)) {
+            return p.content.map((c: any) => c?.text ?? c?.content ?? '').join('');
+          }
+          return '';
+        })
+        .filter(Boolean)
+        .join('\n');
+      if (!text.trim() && typeof content.text === 'string') text = content.text;
+      return { text: text.trim() || '[富文本消息]', messageType: 'richText' };
     }
     case 'picture': {
       // 钉钉图片消息下载码字段为 pictureDownloadCode（Stream 回调里为 content.pictureDownloadCode）
