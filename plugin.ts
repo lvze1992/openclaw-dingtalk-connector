@@ -775,9 +775,12 @@ async function handleDingTalkMessage(params: {
     systemPrompts.push(dingtalkConfig.systemPrompt);
   }
 
+  // useAIStreamCard=false 时跳过 AI Card，直接用普通消息
+  const useAIStreamCard = dingtalkConfig.useAIStreamCard !== false;
+
   // 尝试创建 AI Card，并记录长任务起始时间
   const aiCardStartedAt = Date.now();
-  const card = await createAICard(dingtalkConfig, data, log);
+  const card = useAIStreamCard ? await createAICard(dingtalkConfig, data, log) : null;
 
   if (card) {
     // ===== AI Card 流式模式 =====
@@ -874,8 +877,16 @@ async function handleDingTalkMessage(params: {
     }
 
   } else {
-    // ===== 降级：普通消息模式 =====
-    log?.warn?.(`[DingTalk] AI Card 创建失败，降级为普通消息`);
+    // ===== 普通消息模式（useAIStreamCard=false 或 AI Card 创建失败） =====
+    if (!useAIStreamCard) {
+      log?.info?.(`[DingTalk] useAIStreamCard=false，使用普通消息模式`);
+      // 立即回复"任务已在后台运行"，让用户知道已收到请求
+      await sendMessage(dingtalkConfig, sessionWebhook, '⏳ 任务已在后台运行，请稍候...', {
+        atUserId: !isDirect ? senderId : null,
+      });
+    } else {
+      log?.warn?.(`[DingTalk] AI Card 创建失败，降级为普通消息`);
+    }
 
     let fullResponse = '';
     try {
@@ -961,6 +972,7 @@ const dingtalkPlugin = {
         gatewayToken: { type: 'string', default: '', description: 'Gateway auth token (Bearer)' },
         gatewayPassword: { type: 'string', default: '', description: 'Gateway auth password (alternative to token)' },
         sessionTimeout: { type: 'number', default: 1800000, description: 'Session timeout in ms (default 30min)' },
+        useAIStreamCard: { type: 'boolean', default: true, description: 'Use AI Card streaming; set false to reply via plain text' },
         debug: { type: 'boolean', default: false },
       },
       required: ['clientId', 'clientSecret'],
