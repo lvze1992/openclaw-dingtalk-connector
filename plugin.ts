@@ -63,6 +63,42 @@ function isSenderInAllowlist(senderId: string, allowList: string[]): boolean {
   });
 }
 
+// AI Card 长任务阈值（毫秒）
+const LONG_TASK_NOTIFY_THRESHOLD_MS = 60_000;
+
+/**
+ * 如果 AI Card 处理时间超过阈值，在结束后额外通知一次需求发起人。
+ */
+async function notifyIfLongAICardTask(params: {
+  startedAt: number;
+  isDirect: boolean;
+  dingtalkConfig: any;
+  sessionWebhook: string;
+  senderId: string;
+  log?: any;
+}): Promise<void> {
+  const { startedAt, isDirect, dingtalkConfig, sessionWebhook, senderId, log } = params;
+  const elapsedMs = Date.now() - startedAt;
+
+  if (elapsedMs < LONG_TASK_NOTIFY_THRESHOLD_MS) {
+    return;
+  }
+
+  const elapsedSeconds = Math.round(elapsedMs / 1000);
+  log?.info?.(
+    `[DingTalk] 长任务完成通知: sender=${senderId}, elapsed=${elapsedMs}ms (~${elapsedSeconds}s)`,
+  );
+
+  await sendMessage(
+    dingtalkConfig,
+    sessionWebhook,
+    `✅ 您刚才发起的任务已处理完成，耗时约 ${elapsedSeconds} 秒。`,
+    {
+      atUserId: !isDirect ? senderId : null,
+    },
+  );
+}
+
 // ============ Gateway SSE Streaming ============
 
 interface GatewayOptions {
@@ -796,7 +832,8 @@ async function handleDingTalkMessage(params: {
     systemPrompts.push(dingtalkConfig.systemPrompt);
   }
 
-  // 尝试创建 AI Card
+  // 尝试创建 AI Card，并记录长任务起始时间
+  const aiCardStartedAt = Date.now();
   const card = await createAICard(dingtalkConfig, data, log);
 
   if (card) {
@@ -871,6 +908,16 @@ async function handleDingTalkMessage(params: {
         await finishAICard(card, finalContent, log);
       }
       log?.info?.(`[DingTalk] 流式响应完成，共 ${finalContent.length} 字符`);
+
+      // 长任务完成后额外通知需求发起人（仅当耗时超过阈值）
+      await notifyIfLongAICardTask({
+        startedAt: aiCardStartedAt,
+        isDirect,
+        dingtalkConfig,
+        sessionWebhook,
+        senderId,
+        log,
+      });
 
     } catch (err: any) {
       log?.error?.(`[DingTalk] Gateway 调用失败: ${err.message}`);
