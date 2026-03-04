@@ -341,6 +341,16 @@ async function sendAICardInternal(
       return { ok: true, usedAICard: false };
     }
 
+    // useAIStreamCard=false 时跳过 AI Card，直接用普通消息
+    const useAIStreamCard = config.useAIStreamCard !== false;
+    if (!useAIStreamCard) {
+      log?.info?.(`[DingTalk][AICard][Proactive] useAIStreamCard=false，使用普通消息`);
+      if (target.type === 'user') {
+        return sendNormalToUser(config, target.userId, trimmedContent, { msgType: 'markdown', log });
+      }
+      return sendNormalToGroup(config, target.openConversationId!, trimmedContent, { msgType: 'markdown', log });
+    }
+
     // 5. 创建卡片（复用通用函数）
     const card = await createAICardForTarget(config, target, log);
     if (!card) {
