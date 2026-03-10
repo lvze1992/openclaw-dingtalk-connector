@@ -35,6 +35,8 @@ import {
 
 // ============ 常量 ============
 
+const DINGTALK_API = 'https://api.dingtalk.com';
+
 export const id = 'dingtalk-connector';
 
 let runtime: PluginRuntime | null = null;
